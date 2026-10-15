@@ -19,7 +19,7 @@ function Header(){
   return <header className={scrolled ? 'site-header scrolled' : 'site-header'}>
     <div className="site-container header-inner">
       <Link to="/" className="brand-mark" aria-label="Kumchop home">
-        <img src="/kumchop-logo.png" alt="Kumchop" style={{height: 42, width: 'auto'}} onError={(e) => { (e.currentTarget as HTMLImageElement).src = logo.url; }} />
+        <img src="/kumchop-logo.svg" alt="Kumchop" style={{height: 42, width: 'auto'}} onError={(e) => { (e.currentTarget as HTMLImageElement).src = logo.url; }} />
       </Link>
       <nav className="desktop-nav" aria-label="Main navigation">
         {links.map((link)=> <Link key={link.to} to={link.to} className={location.pathname===link.to ? 'active' : undefined}>{link.label}</Link>)}
@@ -41,7 +41,7 @@ function Header(){
 }
 
 function Footer(){
-  return <footer className="site-footer"><div className="site-container footer-grid"><div className="footer-brand"><Link to="/"><img src="/kumchop-logo.png" alt="Kumchop logo" style={{height: 42, width: 'auto'}} onError={(e) => { (e.currentTarget as HTMLImageElement).src = logo.url; }} /></Link><p>Warm meals, good vibes and unforgettable flavours.</p></div><div className="footer-column"><h3>Visit</h3><p>{restaurant.location}</p><p>Open daily</p></div><div className="footer-column"><h3>Contact</h3><p>{restaurant.phone}</p><p>{restaurant.email}</p></div><div className="footer-column"><h3>Explore</h3><Link to="/menu">Menu</Link><Link to="/order">Order Online</Link><Link to="/gallery">Gallery</Link></div></div></footer>;
+  return <footer className="site-footer"><div className="site-container footer-grid"><div className="footer-brand"><Link to="/"><img src="/kumchop-logo.svg" alt="Kumchop logo" style={{height: 42, width: 'auto'}} onError={(e) => { (e.currentTarget as HTMLImageElement).src = logo.url; }} /></Link><p>Warm meals, good vibes and unforgettable flavours.</p></div><div className="footer-column"><h3>Visit</h3><p>{restaurant.location}</p><p>Open daily</p></div><div className="footer-column"><h3>Contact</h3><p>{restaurant.phone}</p><p>{restaurant.email}</p></div><div className="footer-column"><h3>Explore</h3><Link to="/menu">Menu</Link><Link to="/order">Order Online</Link><Link to="/gallery">Gallery</Link></div></div></footer>;
 }
 
 export function RestaurantShell({children}:{children:ReactNode}){return <CartProvider><a href="#main-content" className="skip-link">Skip to content</a><Header/><main id="main-content">{children}</main><CartDrawer/><Footer/></CartProvider>;
