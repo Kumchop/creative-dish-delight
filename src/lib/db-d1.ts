@@ -27,9 +27,8 @@ function rowToOrder(row: any) {
 
 export async function ensureSchema(env: any) {
   const d1 = env?.KUMCHOP;
-  if (!d1) throw new Error('D1 binding KUMCHOP is not available on env');
+  if (!d1) throw new Error('Cloudflare D1 binding KUMCHOP is missing. Create the D1 database and bind it with the name KUMCHOP in your Pages/Worker project settings.');
 
-  // Create table if not exists. D1 supports executing DDL via prepare().run().
   await d1.prepare(`
     CREATE TABLE IF NOT EXISTS orders (
       id TEXT PRIMARY KEY,
@@ -52,7 +51,7 @@ export async function ensureSchema(env: any) {
 
 export async function insertOrder(env: any, order: OrderSubmission) {
   const d1 = env?.KUMCHOP;
-  if (!d1) throw new Error('D1 binding KUMCHOP is not available on env');
+  if (!d1) throw new Error('Cloudflare D1 binding KUMCHOP is missing. Create the D1 database and bind it with the name KUMCHOP in your Pages/Worker project settings.');
   const sql = `INSERT INTO orders (id, created_at, name, phone, email, order_type, address, time, notes, subtotal_kobo, delivery_fee_kobo, total_kobo, raw_json, status)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
   const raw = JSON.stringify(order);
@@ -77,7 +76,7 @@ export async function insertOrder(env: any, order: OrderSubmission) {
 
 export async function listOrders(env: any, limit = 50, offset = 0) {
   const d1 = env?.KUMCHOP;
-  if (!d1) throw new Error('D1 binding KUMCHOP is not available on env');
+  if (!d1) throw new Error('Cloudflare D1 binding KUMCHOP is missing. Create the D1 database and bind it with the name KUMCHOP in your Pages/Worker project settings.');
   const sql = `SELECT id, created_at, name, phone, subtotal_kobo, total_kobo, status, raw_json FROM orders ORDER BY created_at DESC LIMIT ? OFFSET ?`;
   const res = await d1.prepare(sql).bind(limit, offset).all();
   const rows = (res?.results ?? []) as any[];
@@ -95,7 +94,7 @@ export async function listOrders(env: any, limit = 50, offset = 0) {
 
 export async function getOrder(env: any, id: string) {
   const d1 = env?.KUMCHOP;
-  if (!d1) throw new Error('D1 binding KUMCHOP is not available on env');
+  if (!d1) throw new Error('Cloudflare D1 binding KUMCHOP is missing. Create the D1 database and bind it with the name KUMCHOP in your Pages/Worker project settings.');
   const sql = `SELECT * FROM orders WHERE id = ?`;
   const res = await d1.prepare(sql).bind(id).all();
   const row = (res?.results ?? [])[0];
@@ -105,9 +104,8 @@ export async function getOrder(env: any, id: string) {
 
 export async function updateOrderStatus(env: any, id: string, status: string) {
   const d1 = env?.KUMCHOP;
-  if (!d1) throw new Error('D1 binding KUMCHOP is not available on env');
+  if (!d1) throw new Error('Cloudflare D1 binding KUMCHOP is missing. Create the D1 database and bind it with the name KUMCHOP in your Pages/Worker project settings.');
   const sql = `UPDATE orders SET status = ? WHERE id = ?`;
   const r = await d1.prepare(sql).bind(status, id).run();
-  // Depending on D1 run() result shape, check success
   return (r && (r.success || (r.changes && r.changes > 0))) ?? true;
 }
