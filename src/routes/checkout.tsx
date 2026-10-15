@@ -21,12 +21,38 @@ function Checkout() {
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [sentAt, setSentAt] = useState<number | null>(null);
   const fee = deliveryFee(type);
-  const submit = (ev: FormEvent<HTMLFormElement>) => {
+  const submit = async (ev: FormEvent<HTMLFormElement>) => {
     ev.preventDefault();
     if (sentAt && Date.now() - sentAt < 5000) return;
     const f = new FormData(ev.currentTarget); const g = (k: string) => String(f.get(k) ?? '').trim();
     const o: OrderDetails = {name: g('name'), phone: g('phone'), email: g('email') || undefined, orderType: type, address: g('address') || undefined, time: g('time') || undefined, notes: g('notes') || undefined};
     const e = validateOrder(o); setErrors(e); if (Object.keys(e).length) return;
+
+    const orderPayload = {
+      ...o,
+      lines: lines.map((line) => {
+        const item = findItem(line.id);
+        return item ? {id: item.id, quantity: line.quantity, name: item.name, priceKobo: item.priceKobo} : null;
+      }).filter((line): line is {id: string; quantity: number; name: string; priceKobo: number} => line !== null),
+    };
+
+    try {
+      const response = await fetch('/api/orders', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(orderPayload),
+      });
+
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null) as {message?: string} | null;
+        setErrors({form: payload?.message ?? 'Your order could not be submitted. Please try again.'});
+        return;
+      }
+    } catch {
+      setErrors({form: 'Your order could not be submitted right now. Please try again.'});
+      return;
+    }
+
     const url = whatsappUrl(lines, o); if (!url) return;
     setSentAt(Date.now()); window.open(url, '_blank', 'noopener');
   };
@@ -46,6 +72,7 @@ function Checkout() {
           <label className="form-wide">Order notes (optional)<textarea name="notes" placeholder="Allergies, extra pepper, etc." /></label>
           <div className="form-wide">
             <Button type="submit" size="lg" disabled={!canSubmitOrder(lines)} className="w-full"><MessageCircle />Send order on WhatsApp</Button>
+            {errors.form && <p role="alert" className="field-error mt-2">{errors.form}</p>}
             <p className="fine-print">Your order is sent to Kumchop ({restaurant.primaryOrderingNumber}) on WhatsApp. It is only confirmed once Kumchop replies.</p>
             {sentAt && <p role="status" className="form-feedback">WhatsApp opened with your order. Tap send in WhatsApp, then wait for Kumchop to confirm. Not opened? Allow pop-ups and try again.</p>}
             <div className="notice mt-5"><CreditCard size={16} className="inline mr-2" /><strong>Card payment is not available yet.</strong> Pay as agreed with Kumchop when they confirm your order.</div>
