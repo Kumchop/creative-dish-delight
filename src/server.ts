@@ -3,6 +3,7 @@ import "./lib/error-capture";
 import { consumeLastCapturedError } from "./lib/error-capture";
 import { renderErrorPage } from "./lib/error-page";
 import type { CartLine, OrderDetails } from "./lib/menu";
+import { menuRecords } from "./lib/menu-data";
 
 type ServerEntry = {
   fetch: (request: Request, env: unknown, ctx: unknown) => Promise<Response> | Response;
@@ -19,14 +20,12 @@ type OrderSubmission = {
   time?: string;
   notes?: string;
   lines: Array<{ id: string; quantity: number; name: string; priceKobo: number }>;
+  subtotalKobo: number;
+  deliveryFeeKobo: number | null;
+  totalKobo: number;
 };
 
-type SerializedOrderMessage = {
-  ok: boolean;
-  orderId?: string;
-  queued: boolean;
-  message: string;
-};
+const ORDERS_PATH = "src/data/orders.jsonl";
 
 const getEnv = (key: string): string | undefined => {
   if (typeof process !== "undefined" && process.env && typeof process.env[key] === "string") {
@@ -43,7 +42,7 @@ const getEnv = (key: string): string | undefined => {
   return undefined;
 };
 
-const isOrderPayload = (value: unknown): value is OrderDetails & { lines: CartLine[] } => {
+const isOrderPayload = (value: unknown): value is OrderDetails & { lines: unknown[] } => {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Record<string, unknown>;
   if (!Array.isArray(candidate.lines) || candidate.lines.length === 0) return false;
@@ -55,33 +54,75 @@ const isOrderPayload = (value: unknown): value is OrderDetails & { lines: CartLi
   return true;
 };
 
-const normalizeOrder = (value: OrderDetails & { lines: CartLine[] }): OrderSubmission => {
+const resolveLine = (line: any) => {
+  const rec = menuRecords.find((r) => r.id === line.id);
+  const name = (rec && rec.name) || (typeof line.name === "string" && line.name) || line.id;
+  const priceKobo = (rec && typeof rec.priceKobo === "number" ? rec.priceKobo : typeof line.priceKobo === "number" ? line.priceKobo : 0);
+  const qty = Number.isInteger(line.quantity) ? Math.max(0, line.quantity) : 0;
+  return { id: line.id, quantity: qty, name, priceKobo };
+};
+
+const normalizeOrder = (value: OrderDetails & { lines: unknown[] }): OrderSubmission => {
+  const lines = value.lines.map((l) => resolveLine(l));
+  const subtotalKobo = lines.reduce((t, l) => t + l.priceKobo * l.quantity, 0);
+  const deliveryFeeKobo = null; // Keep using restaurant config on client/server if needed
+  const totalKobo = subtotalKobo + (deliveryFeeKobo ?? 0);
+
   return {
     id: crypto.randomUUID(),
     createdAt: new Date().toISOString(),
     name: value.name.trim(),
     phone: value.phone.trim(),
-    email: value.email?.trim() || undefined,
+    email: (value.email as string | undefined)?.trim() || undefined,
     orderType: value.orderType,
-    address: value.address?.trim() || undefined,
-    time: value.time?.trim() || undefined,
-    notes: value.notes?.trim() || undefined,
-    lines: value.lines.map((line) => ({
-      id: line.id,
-      quantity: line.quantity,
-      name: line.id,
-      priceKobo: 0,
-    })),
+    address: (value.address as string | undefined)?.trim() || undefined,
+    time: (value.time as string | undefined)?.trim() || undefined,
+    notes: (value.notes as string | undefined)?.trim() || undefined,
+    lines,
+    subtotalKobo,
+    deliveryFeeKobo,
+    totalKobo,
   };
+};
+
+const appendOrderToFile = async (order: OrderSubmission): Promise<boolean> => {
+  try {
+    // Try Node fs.promises - works in Node environments. Use dynamic import so edge runtimes don't fail at import time.
+    const fs = await import("fs/promises");
+    const path = await import("path");
+    const dir = path.dirname(ORDERS_PATH);
+    try {
+      await fs.mkdir(dir, { recursive: true });
+    } catch {}
+    await fs.appendFile(ORDERS_PATH, JSON.stringify(order) + "\n", { encoding: "utf8" });
+    return true;
+  } catch (err) {
+    console.warn("Could not write order to file system (this may be an edge/runtime limitation). Falling back to in-memory storage.", err);
+    // Fall through to in-memory storage
+    return false;
+  }
+};
+
+const upsertOrder = async (order: OrderSubmission) => {
+  const persisted = await appendOrderToFile(order);
+
+  const globalWithOrders = globalThis as typeof globalThis & {
+    __kumchopOrders?: OrderSubmission[];
+  };
+
+  globalWithOrders.__kumchopOrders ??= [];
+  globalWithOrders.__kumchopOrders.push(order);
+
+  return persisted;
 };
 
 const buildOrderSummary = (order: OrderSubmission): string => {
   const lines = order.lines
-    .map((line) => `• ${line.quantity} × ${line.name}`)
+    .map((line) => `• ${line.quantity} × ${line.name} @ ₦${Math.round(line.priceKobo / 100)}`)
     .join("\n");
 
   return [
-    "New Kumchop order request",
+    "*New Kumchop order request*",
     "",
     `Name: ${order.name}`,
     `Phone: ${order.phone}`,
@@ -90,8 +131,12 @@ const buildOrderSummary = (order: OrderSubmission): string => {
     order.orderType === "delivery" && order.address ? `Delivery address: ${order.address}` : undefined,
     order.time ? `Preferred time: ${order.time}` : undefined,
     "",
-    "Items:",
+    "*Items*",
     lines || "No items",
+    "",
+    `Subtotal: ₦${Math.round(order.subtotalKobo / 100)}`,
+    order.deliveryFeeKobo === null ? `Delivery fee: To be confirmed` : `Delivery fee: ₦${Math.round(order.deliveryFeeKobo / 100)}`,
+    `Total: ₦${Math.round(order.totalKobo / 100)}`,
     order.notes ? `\nNotes: ${order.notes}` : undefined,
     "",
     "Please confirm this order.",
@@ -100,41 +145,56 @@ const buildOrderSummary = (order: OrderSubmission): string => {
     .join("\n");
 };
 
-const upsertOrder = (order: OrderSubmission) => {
-  const globalWithOrders = globalThis as typeof globalThis & {
-    __kumchopOrders?: OrderSubmission[];
-  };
-
-  globalWithOrders.__kumchopOrders ??= [];
-  globalWithOrders.__kumchopOrders.push(order);
+const notifySlack = async (order: OrderSubmission): Promise<boolean> => {
+  const webhook = getEnv("SLACK_WEBHOOK_URL");
+  if (!webhook) return false;
+  try {
+    const res = await fetch(webhook, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: buildOrderSummary(order) }),
+    });
+    return res.ok;
+  } catch (err) {
+    console.warn("Slack notification failed", err);
+    return false;
+  }
 };
 
-const maybeSendWhatsAppToRestaurant = async (order: OrderSubmission): Promise<void> => {
+const maybeSendWhatsAppToRestaurant = async (order: OrderSubmission): Promise<boolean> => {
   const token = getEnv("WHATSAPP_CLOUD_TOKEN") ?? getEnv("WHATSAPP_TOKEN");
   const phoneNumberId = getEnv("WHATSAPP_PHONE_NUMBER_ID");
   const recipient = getEnv("WHATSAPP_TO_NUMBER") ?? getEnv("WHATSAPP_RECEIPIENT_NUMBER");
 
-  if (!token || !phoneNumberId || !recipient) return;
+  if (!token || !phoneNumberId || !recipient) return false;
 
-  const response = await fetch(`https://graph.facebook.com/v17.0/${phoneNumberId}/messages`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      messaging_product: "whatsapp",
-      to: recipient,
-      type: "text",
-      text: {
-        body: buildOrderSummary(order),
+  try {
+    const response = await fetch(`https://graph.facebook.com/v17.0/${phoneNumberId}/messages`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
       },
-    }),
-  });
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        to: recipient,
+        type: "text",
+        text: {
+          body: buildOrderSummary(order),
+        },
+      }),
+    });
 
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`WhatsApp API rejected the order notification: ${response.status} ${text}`);
+    if (!response.ok) {
+      const text = await response.text().catch(() => "(no body)");
+      console.warn(`WhatsApp API rejected the order notification: ${response.status} ${text}`);
+      return false;
+    }
+
+    return true;
+  } catch (err) {
+    console.warn("WhatsApp API request failed", err);
+    return false;
   }
 };
 
@@ -143,51 +203,36 @@ const handleOrderSubmission = async (request: Request): Promise<Response> => {
     const payload = (await request.json()) as unknown;
     if (!isOrderPayload(payload)) {
       return new Response(
-        JSON.stringify({
-          ok: false,
-          queued: false,
-          message: "Invalid order payload. Missing lines, customer name, phone, or order type.",
-        } satisfies SerializedOrderMessage),
-        {
-          status: 400,
-          headers: { "content-type": "application/json; charset=utf-8" },
-        },
+        JSON.stringify({ ok: false, queued: false, message: "Invalid order payload. Missing lines, customer name, phone, or order type." }),
+        { status: 400, headers: { "content-type": "application/json; charset=utf-8" } },
       );
     }
 
     const order = normalizeOrder(payload);
-    upsertOrder(order);
 
+    const persisted = await upsertOrder(order);
+
+    // Try to notify via WhatsApp; if that fails, try Slack webhook as a fallback.
+    let notified = false;
     try {
-      await maybeSendWhatsAppToRestaurant(order);
-    } catch (error) {
-      console.warn("Order stored but WhatsApp notification did not send:", error);
+      notified = await maybeSendWhatsAppToRestaurant(order);
+      if (!notified) {
+        const slackOk = await notifySlack(order);
+        if (!slackOk) console.warn("Order notification failed for both WhatsApp and Slack.");
+      }
+    } catch (err) {
+      console.warn("Notification attempt failed", err);
     }
 
     return new Response(
-      JSON.stringify({
-        ok: true,
-        orderId: order.id,
-        queued: true,
-        message: "Order received and queued for the restaurant.",
-      } satisfies SerializedOrderMessage),
-      {
-        status: 200,
-        headers: { "content-type": "application/json; charset=utf-8" },
-      },
+      JSON.stringify({ ok: true, orderId: order.id, queued: true, message: "Order received and queued for the restaurant.", persisted, notified }),
+      { status: 200, headers: { "content-type": "application/json; charset=utf-8" } },
     );
   } catch (error) {
     console.error(error);
     return new Response(
-      JSON.stringify({
-        ok: false,
-        queued: false,
-        message: "There was a problem processing the order.",
-      } satisfies SerializedOrderMessage),
-      {
-        status: 500,
-        headers: { "content-type": "application/json; charset=utf-8" },
-      },
+      JSON.stringify({ ok: false, queued: false, message: "There was a problem processing the order." }),
+      { status: 500, headers: { "content-type": "application/json; charset=utf-8" } },
     );
   }
 };
@@ -196,9 +241,7 @@ let serverEntryPromise: Promise<ServerEntry> | undefined;
 
 async function getServerEntry(): Promise<ServerEntry> {
   if (!serverEntryPromise) {
-    serverEntryPromise = import("@tanstack/react-start/server-entry").then(
-      (m) => (m.default ?? m) as ServerEntry,
-    );
+    serverEntryPromise = import("@tanstack/react-start/server-entry").then((m) => (m.default ?? m) as ServerEntry);
   }
   return serverEntryPromise;
 }
@@ -212,10 +255,7 @@ async function normalizeCatastrophicSsrResponse(response: Response): Promise<Res
   if (!isH3SwallowedErrorBody(body)) return response;
 
   console.error(consumeLastCapturedError() ?? new Error(`h3 swallowed SSR error: ${body}`));
-  return new Response(renderErrorPage(), {
-    status: 500,
-    headers: { "content-type": "text/html; charset=utf-8" },
-  });
+  return new Response(renderErrorPage(), { status: 500, headers: { "content-type": "text/html; charset=utf-8" } });
 }
 
 function isH3SwallowedErrorBody(body: string): boolean {
@@ -241,10 +281,7 @@ export default {
       return await normalizeCatastrophicSsrResponse(response);
     } catch (error) {
       console.error(error);
-      return new Response(renderErrorPage(), {
-        status: 500,
-        headers: { "content-type": "text/html; charset=utf-8" },
-      });
+      return new Response(renderErrorPage(), { status: 500, headers: { "content-type": "text/html; charset=utf-8" } });
     }
   },
 };
