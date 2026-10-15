@@ -1,3 +1,4 @@
+// src/server.ts
 import "./lib/error-capture";
 
 import { consumeLastCapturedError } from "./lib/error-capture";
@@ -27,7 +28,9 @@ function runtimeEnv(envParam: any, key: string) {
 
 function atobPoly(b64: string) {
   if (typeof atob === "function") return atob(b64);
-  return Buffer.from(b64, "base64").toString("utf8");
+  // Node fallback for local dev
+  const buf = Buffer.from(b64, "base64");
+  return buf.toString("utf8");
 }
 
 function parseBasicAuth(request: Request): { user: string; pass: string } | null {
@@ -80,7 +83,7 @@ function requireAdminAuth(request: Request, envParam: any): { ok: true } | { ok:
   return { ok: true };
 }
 
-function isOrderPayload(value: unknown): value is OrderDetails & { lines: unknown[] } {
+const isOrderPayload = (value: unknown): value is OrderDetails & { lines: unknown[] } => {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Record<string, unknown>;
   if (!Array.isArray(candidate.lines) || candidate.lines.length === 0) return false;
@@ -90,7 +93,7 @@ function isOrderPayload(value: unknown): value is OrderDetails & { lines: unknow
     return false;
   }
   return true;
-}
+};
 
 const resolveLine = (line: any) => {
   const rec = menuRecords.find((r) => r.id === line.id);
@@ -100,7 +103,7 @@ const resolveLine = (line: any) => {
   return { id: line.id, quantity: qty, name, priceKobo };
 };
 
-function buildOrderSummary(order: any, envParam: any) {
+function buildOrderSummary(order: any) {
   const lines = order.lines?.map((line: any) => `• ${line.quantity} × ${line.name} @ ₦${Math.round(line.priceKobo / 100)}`).join("\n") ?? "";
   return [
     "*New Kumchop order request*",
@@ -133,7 +136,7 @@ async function notifySlack(envParam: any, order: any): Promise<boolean> {
     const res = await fetch(webhook, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: buildOrderSummary(order, envParam) }),
+      body: JSON.stringify({ text: buildOrderSummary(order) }),
     });
     return res.ok;
   } catch (err) {
@@ -161,7 +164,7 @@ async function maybeSendWhatsAppToRestaurant(envParam: any, order: any): Promise
         to: recipient,
         type: "text",
         text: {
-          body: buildOrderSummary(order, envParam),
+          body: buildOrderSummary(order),
         },
       }),
     });
@@ -179,6 +182,19 @@ async function maybeSendWhatsAppToRestaurant(envParam: any, order: any): Promise
   }
 }
 
+async function persistOrder(envParam: any, order: any) {
+  try {
+    if (!schemaEnsured) {
+      await ensureSchema(envParam);
+      schemaEnsured = true;
+    }
+  } catch (err) {
+    console.warn("ensureSchema failed:", err);
+  }
+
+  await insertOrder(envParam, order);
+}
+
 async function handleOrderSubmission(request: Request, envParam: any): Promise<Response> {
   try {
     const payload = (await request.json()) as unknown;
@@ -189,8 +205,8 @@ async function handleOrderSubmission(request: Request, envParam: any): Promise<R
       });
     }
 
-    const val = payload as OrderDetails & { lines: unknown[] };
-    const lines = val.lines.map((l) => resolveLine(l));
+    const value = payload as OrderDetails & { lines: unknown[] };
+    const lines = value.lines.map((l) => resolveLine(l));
     const subtotalKobo = lines.reduce((t, l) => t + l.priceKobo * l.quantity, 0);
     const deliveryFeeKobo = null;
     const totalKobo = subtotalKobo + (deliveryFeeKobo ?? 0);
@@ -198,43 +214,27 @@ async function handleOrderSubmission(request: Request, envParam: any): Promise<R
     const order = {
       id: crypto.randomUUID(),
       createdAt: new Date().toISOString(),
-      name: val.name.trim(),
-      phone: val.phone.trim(),
-      email: (val.email as string | undefined)?.trim() || undefined,
-      orderType: val.orderType,
-      address: (val.address as string | undefined)?.trim() || undefined,
-      time: (val.time as string | undefined)?.trim() || undefined,
-      notes: (val.notes as string | undefined)?.trim() || undefined,
+      name: value.name.trim(),
+      phone: value.phone.trim(),
+      email: (value.email as string | undefined)?.trim() || undefined,
+      orderType: value.orderType,
+      address: (value.address as string | undefined)?.trim() || undefined,
+      time: (value.time as string | undefined)?.trim() || undefined,
+      notes: (value.notes as string | undefined)?.trim() || undefined,
       lines,
       subtotalKobo,
       deliveryFeeKobo,
       totalKobo,
     } as const;
 
-    // Ensure schema (idempotent). Only run once per worker instance.
-    try {
-      if (!schemaEnsured) {
-        await ensureSchema(envParam);
-        schemaEnsured = true;
-      }
-    } catch (err) {
-      console.warn("ensureSchema failed:", err);
-    }
+    await persistOrder(envParam, order);
 
-    // persist
-    try {
-      await insertOrder(envParam, order as any);
-    } catch (err) {
-      console.error("insertOrder failed:", err);
-      return new Response(JSON.stringify({ ok: false, queued: false, message: "Could not persist order." }), { status: 500, headers: { "content-type": "application/json" } });
-    }
-
-    // try notifications
     let notified = false;
     try {
       notified = await maybeSendWhatsAppToRestaurant(envParam, order);
       if (!notified) {
-        await notifySlack(envParam, order);
+        const slackOk = await notifySlack(envParam, order);
+        if (!slackOk) console.warn("Order notification failed for both WhatsApp and Slack.");
       }
     } catch (err) {
       console.warn("Notification attempt failed", err);
@@ -257,7 +257,6 @@ async function handleAdminApi(request: Request, envParam: any, url: URL): Promis
   const auth = requireAdminAuth(request, envParam);
   if (!auth.ok) return auth.response;
 
-  // List
   if (request.method === "GET" && url.pathname === "/api/admin/orders") {
     const limit = Number(url.searchParams.get("limit") ?? "50");
     const offset = Number(url.searchParams.get("offset") ?? "0");
@@ -270,9 +269,8 @@ async function handleAdminApi(request: Request, envParam: any, url: URL): Promis
     }
   }
 
-  // Get
   if (request.method === "GET" && url.pathname.startsWith("/api/admin/orders/")) {
-    const parts = url.pathname.split('/');
+    const parts = url.pathname.split("/");
     const id = parts[parts.length - 1];
     try {
       const ord = await getOrder(envParam, id);
@@ -284,9 +282,8 @@ async function handleAdminApi(request: Request, envParam: any, url: URL): Promis
     }
   }
 
-  // Update status
   if (request.method === "POST" && url.pathname.startsWith("/api/admin/orders/") && url.pathname.endsWith("/status")) {
-    const parts = url.pathname.split('/');
+    const parts = url.pathname.split("/");
     const id = parts[parts.length - 2];
     try {
       const body = await request.json();
@@ -301,45 +298,75 @@ async function handleAdminApi(request: Request, envParam: any, url: URL): Promis
     }
   }
 
+  if (request.method === "POST" && url.pathname.startsWith("/api/admin/orders/") && url.pathname.endsWith("/resend")) {
+    const parts = url.pathname.split("/");
+    const id = parts[parts.length - 2];
+    try {
+      const ord = await getOrder(envParam, id);
+      if (!ord) return new Response(JSON.stringify({ ok: false, message: "Order not found." }), { status: 404, headers: { "content-type": "application/json" } });
+
+      let notified = false;
+      try {
+        notified = await maybeSendWhatsAppToRestaurant(envParam, ord);
+        if (!notified) {
+          const slackOk = await notifySlack(envParam, ord);
+          if (!slackOk) console.warn("Resend: notification failed for both WhatsApp and Slack.");
+        }
+      } catch (err) {
+        console.warn("Resend notification attempt failed", err);
+      }
+
+      return new Response(JSON.stringify({ ok: true, notified }), { status: 200, headers: { "content-type": "application/json" } });
+    } catch (err) {
+      console.error(err);
+      return new Response(JSON.stringify({ ok: false, message: "Could not resend notifications." }), { status: 500, headers: { "content-type": "application/json" } });
+    }
+  }
+
   return new Response(JSON.stringify({ ok: false, message: "Unsupported admin API route or method." }), { status: 404, headers: { "content-type": "application/json" } });
 }
 
-// h3 swallows in-handler throws into a normal 500 Response with body
-// {"unhandled":true,"message":"HTTPError"} — try/catch alone never fires for those.
 async function normalizeCatastrophicSsrResponse(response: Response): Promise<Response> {
   if (response.status < 500) return response;
   const contentType = response.headers.get("content-type") ?? "";
   if (!contentType.includes("application/json")) return response;
 
   const body = await response.clone().text();
-  if (!isH3SwallowedErrorBody(body)) return response;
-
-  console.error(consumeLastCapturedError() ?? new Error(`h3 swallowed SSR error: ${body}`));
-  return new Response(renderErrorPage(), {
-    status: 500,
-    headers: { "content-type": "text/html; charset=utf-8" },
-  });
-}
-
-function isH3SwallowedErrorBody(body: string): boolean {
   try {
     const payload = JSON.parse(body) as { unhandled?: unknown; message?: unknown };
-    return payload.unhandled === true && payload.message === "HTTPError";
+    if (!(payload.unhandled === true && payload.message === "HTTPError")) return response;
   } catch {
-    return false;
+    return response;
   }
+
+  console.error(consumeLastCapturedError() ?? new Error(`h3 swallowed SSR error: ${body}`));
+  return new Response(renderErrorPage(), { status: 500, headers: { "content-type": "text/html; charset=utf-8" } });
 }
 
 export default {
   async fetch(request: Request, env: any, ctx: unknown) {
     const url = new URL(request.url);
 
-    // Admin API: Basic auth protected
+    // Debug endpoint to check D1 binding and tables. Remove after debugging.
+    if (url.pathname === "/_debug/d1") {
+      const d1 = env?.KUMCHOP;
+      const result: any = { hasBinding: !!d1, timestamp: new Date().toISOString() };
+      if (!d1) {
+        return new Response(JSON.stringify({ ...result, error: "KUMCHOP binding is missing" }), { status: 500, headers: { "content-type": "application/json" } });
+      }
+      try {
+        const res = await d1.prepare("SELECT name FROM sqlite_master WHERE type='table'").all();
+        const tables = (res?.results ?? []).map((r: any) => r.name ?? r);
+        return new Response(JSON.stringify({ ...result, tables }), { headers: { "content-type": "application/json" } });
+      } catch (err) {
+        return new Response(JSON.stringify({ ...result, error: String(err) }), { status: 500, headers: { "content-type": "application/json" } });
+      }
+    }
+
     if (url.pathname.startsWith("/api/admin/orders")) {
       return await handleAdminApi(request, env, url);
     }
 
-    // Orders endpoint
     if (request.method === "POST" && url.pathname === "/api/orders") {
       return await handleOrderSubmission(request, env);
     }
@@ -350,10 +377,7 @@ export default {
       return await normalizeCatastrophicSsrResponse(response);
     } catch (error) {
       console.error(error);
-      return new Response(renderErrorPage(), {
-        status: 500,
-        headers: { "content-type": "text/html; charset=utf-8" },
-      });
+      return new Response(renderErrorPage(), { status: 500, headers: { "content-type": "text/html; charset=utf-8" } });
     }
   },
 };
