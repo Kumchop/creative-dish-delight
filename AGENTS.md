@@ -8,3 +8,7 @@
 > Commits you push to the connected branch sync back to Lovable and show up in
 > the editor, so keep the branch in a working state.
 <!-- LOVABLE:END -->
+
+- Use a shared restaurant shell in the root route and dedicated content routes for each navigation destination so navigation and metadata remain consistent.
+- Keep illustrative menu records and cart calculations in browser-safe modules; persist only the cart locally and block live submission until restaurant details are configured.
+- Centralize the visual system in src/styles.css and use the shared Button component for interactive commands.
