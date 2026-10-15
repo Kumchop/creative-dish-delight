@@ -350,7 +350,14 @@ export default {
     // Debug endpoint to check D1 binding and tables. Remove after debugging.
     if (url.pathname === "/_debug/d1") {
       const d1 = env?.KUMCHOP;
-      const result: any = { hasBinding: !!d1, timestamp: new Date().toISOString() };
+      // collect visible env keys to help debugging (temporary)
+      let envKeys: string[] = [];
+      try {
+        envKeys = Object.keys(env || {}).slice(0, 200);
+      } catch (e) {
+        // ignore
+      }
+      const result: any = { hasBinding: !!d1, timestamp: new Date().toISOString(), envKeys };
       if (!d1) {
         return new Response(JSON.stringify({ ...result, error: "KUMCHOP binding is missing" }), { status: 500, headers: { "content-type": "application/json" } });
       }
