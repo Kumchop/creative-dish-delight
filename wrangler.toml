@@ -1,0 +1,8 @@
+name = "creative-dish-delight"
+compatibility_date = "2026-10-15"
+
+# Configure D1 binding used by the Worker. This ensures `wrangler publish` will include
+# the D1 binding named KUMCHOP pointing to the kumchop_db database.
+[[d1_databases]]
+binding = "KUMCHOP"
+database_name = "kumchop_db"
