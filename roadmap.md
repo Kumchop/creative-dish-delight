@@ -1,6 +1,9 @@
 # Kumchop website
-- [x] Replace the illustrative dining room with the owner's actual restaurant photograph.
-- [x] Build branded pages and original food photography.
-- [x] Build searchable sample menu, locally saved cart, and honest checkout configuration.
-- [x] Build contact, gallery, story, and specials pages.
-- [x] Verify interactions, totals, navigation, and small-screen layouts.
+- [x] Branded pages, real restaurant photo, contact page.
+- [x] Import real menu (79 items, prices, sold-out) from kumchop.com.ng.
+- [x] Order Online page with search, categories, sort, sold-out blocking.
+- [x] Cart page + drawer, saved locally, kobo totals.
+- [x] Checkout with validation and WhatsApp order sending.
+- [ ] Saved orders, confirmation page and admin area — needs Lovable Cloud (awaiting owner go-ahead).
+- [ ] Card payments — needs Paystack/Flutterwave merchant keys.
+- [ ] Confirm: WhatsApp ordering number, delivery fee, Croaker Fish price.
