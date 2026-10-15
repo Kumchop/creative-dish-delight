@@ -2,48 +2,85 @@ import "./lib/error-capture";
 
 import { consumeLastCapturedError } from "./lib/error-capture";
 import { renderErrorPage } from "./lib/error-page";
-import type { CartLine, OrderDetails } from "./lib/menu";
+import type { OrderDetails } from "./lib/menu";
 import { menuRecords } from "./lib/menu-data";
-import { insertOrder, listOrders, getOrder, updateOrderStatus } from "@/lib/db";
+import { ensureSchema, insertOrder, listOrders, getOrder, updateOrderStatus } from "@/lib/db-d1";
 
 type ServerEntry = {
   fetch: (request: Request, env: unknown, ctx: unknown) => Promise<Response> | Response;
 };
 
-type OrderSubmission = {
-  id: string;
-  createdAt: string;
-  name: string;
-  phone: string;
-  email?: string;
-  orderType: "pickup" | "delivery";
-  address?: string;
-  time?: string;
-  notes?: string;
-  lines: Array<{ id: string; quantity: number; name: string; priceKobo: number }>;
-  subtotalKobo: number;
-  deliveryFeeKobo: number | null;
-  totalKobo: number;
-};
+let serverEntryPromise: Promise<ServerEntry> | undefined;
+let schemaEnsured = false;
 
-const ORDERS_PATH = "src/data/orders.jsonl";
-
-const getEnv = (key: string): string | undefined => {
-  if (typeof process !== "undefined" && process.env && typeof process.env[key] === "string") {
-    return process.env[key];
+async function getServerEntry(): Promise<ServerEntry> {
+  if (!serverEntryPromise) {
+    serverEntryPromise = import("@tanstack/react-start/server-entry").then((m) => (m.default ?? m) as ServerEntry);
   }
+  return serverEntryPromise;
+}
 
-  if (typeof import.meta !== "undefined") {
-    const env = (import.meta as { env?: Record<string, string | undefined> }).env;
-    if (env && typeof env[key] === "string") {
-      return env[key];
-    }
+function runtimeEnv(envParam: any, key: string) {
+  if (envParam && typeof envParam[key] !== "undefined") return envParam[key];
+  return typeof process !== "undefined" ? (process.env as any)[key] : undefined;
+}
+
+function atobPoly(b64: string) {
+  if (typeof atob === "function") return atob(b64);
+  return Buffer.from(b64, "base64").toString("utf8");
+}
+
+function parseBasicAuth(request: Request): { user: string; pass: string } | null {
+  const auth = request.headers.get("authorization");
+  if (!auth || !auth.startsWith("Basic ")) return null;
+  try {
+    const b64 = auth.slice(6);
+    const decoded = atobPoly(b64);
+    const sep = decoded.indexOf(":");
+    if (sep === -1) return null;
+    const user = decoded.slice(0, sep);
+    const pass = decoded.slice(sep + 1);
+    return { user, pass };
+  } catch {
+    return null;
   }
+}
 
-  return undefined;
-};
+function requireAdminAuth(request: Request, envParam: any): { ok: true } | { ok: false; response: Response } {
+  const creds = parseBasicAuth(request);
+  const adminUser = runtimeEnv(envParam, "ADMIN_USER");
+  const adminPass = runtimeEnv(envParam, "ADMIN_PASS");
+  if (!adminUser || !adminPass) {
+    return {
+      ok: false,
+      response: new Response(JSON.stringify({ ok: false, message: "Admin credentials not configured on server." }), {
+        status: 500,
+        headers: { "content-type": "application/json" },
+      }),
+    };
+  }
+  if (!creds) {
+    return {
+      ok: false,
+      response: new Response(JSON.stringify({ ok: false, message: "Authentication required." }), {
+        status: 401,
+        headers: { "content-type": "application/json", "WWW-Authenticate": 'Basic realm="Kumchop admin"' },
+      }),
+    };
+  }
+  if (creds.user !== adminUser || creds.pass !== adminPass) {
+    return {
+      ok: false,
+      response: new Response(JSON.stringify({ ok: false, message: "Invalid credentials." }), {
+        status: 403,
+        headers: { "content-type": "application/json" },
+      }),
+    };
+  }
+  return { ok: true };
+}
 
-const isOrderPayload = (value: unknown): value is OrderDetails & { lines: unknown[] } => {
+function isOrderPayload(value: unknown): value is OrderDetails & { lines: unknown[] } {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Record<string, unknown>;
   if (!Array.isArray(candidate.lines) || candidate.lines.length === 0) return false;
@@ -53,86 +90,18 @@ const isOrderPayload = (value: unknown): value is OrderDetails & { lines: unknow
     return false;
   }
   return true;
-};
+}
 
 const resolveLine = (line: any) => {
   const rec = menuRecords.find((r) => r.id === line.id);
   const name = (rec && rec.name) || (typeof line.name === "string" && line.name) || line.id;
-  const priceKobo = (rec && typeof rec.priceKobo === "number" ? rec.priceKobo : typeof line.priceKobo === "number" ? line.priceKobo : 0);
+  const priceKobo = rec && typeof rec.priceKobo === "number" ? rec.priceKobo : typeof line.priceKobo === "number" ? line.priceKobo : 0;
   const qty = Number.isInteger(line.quantity) ? Math.max(0, line.quantity) : 0;
   return { id: line.id, quantity: qty, name, priceKobo };
 };
 
-const normalizeOrder = (value: OrderDetails & { lines: unknown[] }): OrderSubmission => {
-  const lines = value.lines.map((l) => resolveLine(l));
-  const subtotalKobo = lines.reduce((t, l) => t + l.priceKobo * l.quantity, 0);
-  const deliveryFeeKobo = null; // Keep using restaurant config on client/server if needed
-  const totalKobo = subtotalKobo + (deliveryFeeKobo ?? 0);
-
-  return {
-    id: crypto.randomUUID(),
-    createdAt: new Date().toISOString(),
-    name: value.name.trim(),
-    phone: value.phone.trim(),
-    email: (value.email as string | undefined)?.trim() || undefined,
-    orderType: value.orderType,
-    address: (value.address as string | undefined)?.trim() || undefined,
-    time: (value.time as string | undefined)?.trim() || undefined,
-    notes: (value.notes as string | undefined)?.trim() || undefined,
-    lines,
-    subtotalKobo,
-    deliveryFeeKobo,
-    totalKobo,
-  };
-};
-
-const appendOrderToFile = async (order: OrderSubmission): Promise<boolean> => {
-  try {
-    // Try Node fs.promises - works in Node environments. Use dynamic import so edge runtimes don't fail at import time.
-    const fs = await import("fs/promises");
-    const path = await import("path");
-    const dir = path.dirname(ORDERS_PATH);
-    try {
-      await fs.mkdir(dir, { recursive: true });
-    } catch {}
-    await fs.appendFile(ORDERS_PATH, JSON.stringify(order) + "\n", { encoding: "utf8" });
-    return true;
-  } catch (err) {
-    console.warn("Could not write order to file system (this may be an edge/runtime limitation). Falling back to DB/in-memory storage.", err);
-    // Fall through to fallback behavior
-    return false;
-  }
-};
-
-const upsertOrder = async (order: OrderSubmission) => {
-  let persistedToFile = false;
-  try {
-    persistedToFile = await appendOrderToFile(order);
-  } catch {}
-
-  let persistedToDb = false;
-  try {
-    insertOrder(order);
-    persistedToDb = true;
-  } catch (err) {
-    console.warn("Could not persist order to SQLite DB", err);
-  }
-
-  const globalWithOrders = globalThis as typeof globalThis & {
-    __kumchopOrders?: OrderSubmission[];
-  };
-
-  globalWithOrders.__kumchopOrders ??= [];
-  globalWithOrders.__kumchopOrders.push(order);
-
-  return persistedToFile || persistedToDb;
-};
-
-const buildOrderSummary = (order: OrderSubmission): string => {
-  const lines = order.lines
-    .map((line) => `• ${line.quantity} × ${line.name} @ ₦${Math.round(line.priceKobo / 100)}`)
-    .join("\n");
-
+function buildOrderSummary(order: any, envParam: any) {
+  const lines = order.lines?.map((line: any) => `• ${line.quantity} × ${line.name} @ ₦${Math.round(line.priceKobo / 100)}`).join("\n") ?? "";
   return [
     "*New Kumchop order request*",
     "",
@@ -153,30 +122,30 @@ const buildOrderSummary = (order: OrderSubmission): string => {
     "",
     "Please confirm this order.",
   ]
-    .filter((piece): piece is string => typeof piece === "string" && piece.length > 0)
+    .filter((p): p is string => typeof p === "string" && p.length > 0)
     .join("\n");
-};
+}
 
-const notifySlack = async (order: OrderSubmission): Promise<boolean> => {
-  const webhook = getEnv("SLACK_WEBHOOK_URL");
+async function notifySlack(envParam: any, order: any): Promise<boolean> {
+  const webhook = runtimeEnv(envParam, "SLACK_WEBHOOK_URL");
   if (!webhook) return false;
   try {
     const res = await fetch(webhook, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: buildOrderSummary(order) }),
+      body: JSON.stringify({ text: buildOrderSummary(order, envParam) }),
     });
     return res.ok;
   } catch (err) {
     console.warn("Slack notification failed", err);
     return false;
   }
-};
+}
 
-const maybeSendWhatsAppToRestaurant = async (order: OrderSubmission): Promise<boolean> => {
-  const token = getEnv("WHATSAPP_CLOUD_TOKEN") ?? getEnv("WHATSAPP_TOKEN");
-  const phoneNumberId = getEnv("WHATSAPP_PHONE_NUMBER_ID");
-  const recipient = getEnv("WHATSAPP_TO_NUMBER") ?? getEnv("WHATSAPP_RECEIPIENT_NUMBER");
+async function maybeSendWhatsAppToRestaurant(envParam: any, order: any): Promise<boolean> {
+  const token = runtimeEnv(envParam, "WHATSAPP_CLOUD_TOKEN") ?? runtimeEnv(envParam, "WHATSAPP_TOKEN");
+  const phoneNumberId = runtimeEnv(envParam, "WHATSAPP_PHONE_NUMBER_ID");
+  const recipient = runtimeEnv(envParam, "WHATSAPP_TO_NUMBER") ?? runtimeEnv(envParam, "WHATSAPP_RECEIPIENT_NUMBER");
 
   if (!token || !phoneNumberId || !recipient) return false;
 
@@ -192,7 +161,7 @@ const maybeSendWhatsAppToRestaurant = async (order: OrderSubmission): Promise<bo
         to: recipient,
         type: "text",
         text: {
-          body: buildOrderSummary(order),
+          body: buildOrderSummary(order, envParam),
         },
       }),
     });
@@ -208,94 +177,135 @@ const maybeSendWhatsAppToRestaurant = async (order: OrderSubmission): Promise<bo
     console.warn("WhatsApp API request failed", err);
     return false;
   }
-};
-
-function parseBasicAuth(request: Request): { user: string; pass: string } | null {
-  const auth = request.headers.get("authorization");
-  if (!auth || !auth.startsWith("Basic ")) return null;
-  try {
-    const b64 = auth.slice(6);
-    const decoded = atob(b64);
-    const sep = decoded.indexOf(":");
-    if (sep === -1) return null;
-    const user = decoded.slice(0, sep);
-    const pass = decoded.slice(sep + 1);
-    return { user, pass };
-  } catch {
-    return null;
-  }
 }
 
-function requireAdminAuth(request: Request): { ok: true } | { ok: false; response: Response } {
-  const creds = parseBasicAuth(request);
-  const adminUser = getEnv("ADMIN_USER");
-  const adminPass = getEnv("ADMIN_PASS");
-  if (!adminUser || !adminPass) {
-    return { ok: false, response: new Response(JSON.stringify({ ok: false, message: "Admin credentials not configured on server." }), { status: 500, headers: { "content-type": "application/json" } }) };
-  }
-  if (!creds) {
-    return {
-      ok: false,
-      response: new Response(JSON.stringify({ ok: false, message: "Authentication required." }), { status: 401, headers: { "content-type": "application/json", "WWW-Authenticate": 'Basic realm="Kumchop admin"' } }),
-    };
-  }
-  if (creds.user !== adminUser || creds.pass !== adminPass) {
-    return {
-      ok: false,
-      response: new Response(JSON.stringify({ ok: false, message: "Invalid credentials." }), { status: 403, headers: { "content-type": "application/json" } }),
-    };
-  }
-  return { ok: true };
-}
-
-const handleOrderSubmission = async (request: Request): Promise<Response> => {
+async function handleOrderSubmission(request: Request, envParam: any): Promise<Response> {
   try {
     const payload = (await request.json()) as unknown;
     if (!isOrderPayload(payload)) {
-      return new Response(
-        JSON.stringify({ ok: false, queued: false, message: "Invalid order payload. Missing lines, customer name, phone, or order type." }),
-        { status: 400, headers: { "content-type": "application/json; charset=utf-8" } },
-      );
+      return new Response(JSON.stringify({ ok: false, queued: false, message: "Invalid order payload. Missing lines, customer name, phone, or order type." }), {
+        status: 400,
+        headers: { "content-type": "application/json; charset=utf-8" },
+      });
     }
 
-    const order = normalizeOrder(payload);
+    const val = payload as OrderDetails & { lines: unknown[] };
+    const lines = val.lines.map((l) => resolveLine(l));
+    const subtotalKobo = lines.reduce((t, l) => t + l.priceKobo * l.quantity, 0);
+    const deliveryFeeKobo = null;
+    const totalKobo = subtotalKobo + (deliveryFeeKobo ?? 0);
 
-    const persisted = await upsertOrder(order);
+    const order = {
+      id: crypto.randomUUID(),
+      createdAt: new Date().toISOString(),
+      name: val.name.trim(),
+      phone: val.phone.trim(),
+      email: (val.email as string | undefined)?.trim() || undefined,
+      orderType: val.orderType,
+      address: (val.address as string | undefined)?.trim() || undefined,
+      time: (val.time as string | undefined)?.trim() || undefined,
+      notes: (val.notes as string | undefined)?.trim() || undefined,
+      lines,
+      subtotalKobo,
+      deliveryFeeKobo,
+      totalKobo,
+    } as const;
 
-    // Try to notify via WhatsApp; if that fails, try Slack webhook as a fallback.
+    // Ensure schema (idempotent). Only run once per worker instance.
+    try {
+      if (!schemaEnsured) {
+        await ensureSchema(envParam);
+        schemaEnsured = true;
+      }
+    } catch (err) {
+      console.warn("ensureSchema failed:", err);
+    }
+
+    // persist
+    try {
+      await insertOrder(envParam, order as any);
+    } catch (err) {
+      console.error("insertOrder failed:", err);
+      return new Response(JSON.stringify({ ok: false, queued: false, message: "Could not persist order." }), { status: 500, headers: { "content-type": "application/json" } });
+    }
+
+    // try notifications
     let notified = false;
     try {
-      notified = await maybeSendWhatsAppToRestaurant(order);
+      notified = await maybeSendWhatsAppToRestaurant(envParam, order);
       if (!notified) {
-        const slackOk = await notifySlack(order);
-        if (!slackOk) console.warn("Order notification failed for both WhatsApp and Slack.");
+        await notifySlack(envParam, order);
       }
     } catch (err) {
       console.warn("Notification attempt failed", err);
     }
 
-    return new Response(
-      JSON.stringify({ ok: true, orderId: order.id, queued: true, message: "Order received and queued for the restaurant.", persisted, notified }),
-      { status: 200, headers: { "content-type": "application/json; charset=utf-8" } },
-    );
+    return new Response(JSON.stringify({ ok: true, orderId: order.id, queued: true, message: "Order received and queued for the restaurant.", notified }), {
+      status: 200,
+      headers: { "content-type": "application/json; charset=utf-8" },
+    });
   } catch (error) {
     console.error(error);
-    return new Response(
-      JSON.stringify({ ok: false, queued: false, message: "There was a problem processing the order." }),
-      { status: 500, headers: { "content-type": "application/json; charset=utf-8" } },
-    );
+    return new Response(JSON.stringify({ ok: false, queued: false, message: "There was a problem processing the order." }), {
+      status: 500,
+      headers: { "content-type": "application/json; charset=utf-8" },
+    });
   }
-};
-
-let serverEntryPromise: Promise<ServerEntry> | undefined;
-
-async function getServerEntry(): Promise<ServerEntry> {
-  if (!serverEntryPromise) {
-    serverEntryPromise = import("@tanstack/react-start/server-entry").then((m) => (m.default ?? m) as ServerEntry);
-  }
-  return serverEntryPromise;
 }
 
+async function handleAdminApi(request: Request, envParam: any, url: URL): Promise<Response> {
+  const auth = requireAdminAuth(request, envParam);
+  if (!auth.ok) return auth.response;
+
+  // List
+  if (request.method === "GET" && url.pathname === "/api/admin/orders") {
+    const limit = Number(url.searchParams.get("limit") ?? "50");
+    const offset = Number(url.searchParams.get("offset") ?? "0");
+    try {
+      const rows = await listOrders(envParam, limit, offset);
+      return new Response(JSON.stringify({ ok: true, orders: rows }), { status: 200, headers: { "content-type": "application/json" } });
+    } catch (err) {
+      console.error(err);
+      return new Response(JSON.stringify({ ok: false, message: "Could not list orders." }), { status: 500, headers: { "content-type": "application/json" } });
+    }
+  }
+
+  // Get
+  if (request.method === "GET" && url.pathname.startsWith("/api/admin/orders/")) {
+    const parts = url.pathname.split('/');
+    const id = parts[parts.length - 1];
+    try {
+      const ord = await getOrder(envParam, id);
+      if (!ord) return new Response(JSON.stringify({ ok: false, message: "Order not found." }), { status: 404, headers: { "content-type": "application/json" } });
+      return new Response(JSON.stringify({ ok: true, order: ord }), { status: 200, headers: { "content-type": "application/json" } });
+    } catch (err) {
+      console.error(err);
+      return new Response(JSON.stringify({ ok: false, message: "Could not fetch order." }), { status: 500, headers: { "content-type": "application/json" } });
+    }
+  }
+
+  // Update status
+  if (request.method === "POST" && url.pathname.startsWith("/api/admin/orders/") && url.pathname.endsWith("/status")) {
+    const parts = url.pathname.split('/');
+    const id = parts[parts.length - 2];
+    try {
+      const body = await request.json();
+      const status = body?.status as string | undefined;
+      if (!status) return new Response(JSON.stringify({ ok: false, message: "Missing status." }), { status: 400, headers: { "content-type": "application/json" } });
+      const ok = await updateOrderStatus(envParam, id, status);
+      if (!ok) return new Response(JSON.stringify({ ok: false, message: "Order not found or not updated." }), { status: 404, headers: { "content-type": "application/json" } });
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+    } catch (err) {
+      console.error(err);
+      return new Response(JSON.stringify({ ok: false, message: "Could not update status." }), { status: 500, headers: { "content-type": "application/json" } });
+    }
+  }
+
+  return new Response(JSON.stringify({ ok: false, message: "Unsupported admin API route or method." }), { status: 404, headers: { "content-type": "application/json" } });
+}
+
+// h3 swallows in-handler throws into a normal 500 Response with body
+// {"unhandled":true,"message":"HTTPError"} — try/catch alone never fires for those.
 async function normalizeCatastrophicSsrResponse(response: Response): Promise<Response> {
   if (response.status < 500) return response;
   const contentType = response.headers.get("content-type") ?? "";
@@ -305,7 +315,10 @@ async function normalizeCatastrophicSsrResponse(response: Response): Promise<Res
   if (!isH3SwallowedErrorBody(body)) return response;
 
   console.error(consumeLastCapturedError() ?? new Error(`h3 swallowed SSR error: ${body}`));
-  return new Response(renderErrorPage(), { status: 500, headers: { "content-type": "text/html; charset=utf-8" } });
+  return new Response(renderErrorPage(), {
+    status: 500,
+    headers: { "content-type": "text/html; charset=utf-8" },
+  });
 }
 
 function isH3SwallowedErrorBody(body: string): boolean {
@@ -318,62 +331,17 @@ function isH3SwallowedErrorBody(body: string): boolean {
 }
 
 export default {
-  async fetch(request: Request, env: unknown, ctx: unknown) {
+  async fetch(request: Request, env: any, ctx: unknown) {
     const url = new URL(request.url);
 
     // Admin API: Basic auth protected
     if (url.pathname.startsWith("/api/admin/orders")) {
-      const auth = requireAdminAuth(request);
-      if (!auth.ok) return auth.response;
-
-      // GET /api/admin/orders
-      if (request.method === "GET" && url.pathname === "/api/admin/orders") {
-        const limit = Number(url.searchParams.get("limit") ?? "50");
-        const offset = Number(url.searchParams.get("offset") ?? "0");
-        try {
-          const rows = listOrders(limit, offset);
-          return new Response(JSON.stringify({ ok: true, orders: rows }), { status: 200, headers: { "content-type": "application/json" } });
-        } catch (err) {
-          console.error(err);
-          return new Response(JSON.stringify({ ok: false, message: "Could not list orders." }), { status: 500, headers: { "content-type": "application/json" } });
-        }
-      }
-
-      // GET /api/admin/orders/:id
-      if (request.method === "GET" && url.pathname.startsWith("/api/admin/orders/")) {
-        const id = url.pathname.split("/").at(-1) as string;
-        try {
-          const ord = getOrder(id);
-          if (!ord) return new Response(JSON.stringify({ ok: false, message: "Order not found." }), { status: 404, headers: { "content-type": "application/json" } });
-          return new Response(JSON.stringify({ ok: true, order: ord }), { status: 200, headers: { "content-type": "application/json" } });
-        } catch (err) {
-          console.error(err);
-          return new Response(JSON.stringify({ ok: false, message: "Could not fetch order." }), { status: 500, headers: { "content-type": "application/json" } });
-        }
-      }
-
-      // POST /api/admin/orders/:id/status
-      if (request.method === "POST" && url.pathname.startsWith("/api/admin/orders/") && url.pathname.endsWith("/status")) {
-        const parts = url.pathname.split("/");
-        const id = parts[parts.length - 2];
-        try {
-          const body = await request.json();
-          const status = body?.status as string | undefined;
-          if (!status) return new Response(JSON.stringify({ ok: false, message: "Missing status." }), { status: 400, headers: { "content-type": "application/json" } });
-          const ok = updateOrderStatus(id, status);
-          if (!ok) return new Response(JSON.stringify({ ok: false, message: "Order not found or not updated." }), { status: 404, headers: { "content-type": "application/json" } });
-          return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
-        } catch (err) {
-          console.error(err);
-          return new Response(JSON.stringify({ ok: false, message: "Could not update status." }), { status: 500, headers: { "content-type": "application/json" } });
-        }
-      }
-
-      return new Response(JSON.stringify({ ok: false, message: "Unsupported admin API route or method." }), { status: 404, headers: { "content-type": "application/json" } });
+      return await handleAdminApi(request, env, url);
     }
 
+    // Orders endpoint
     if (request.method === "POST" && url.pathname === "/api/orders") {
-      return handleOrderSubmission(request);
+      return await handleOrderSubmission(request, env);
     }
 
     try {
@@ -382,7 +350,10 @@ export default {
       return await normalizeCatastrophicSsrResponse(response);
     } catch (error) {
       console.error(error);
-      return new Response(renderErrorPage(), { status: 500, headers: { "content-type": "text/html; charset=utf-8" } });
+      return new Response(renderErrorPage(), {
+        status: 500,
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
     }
   },
 };
