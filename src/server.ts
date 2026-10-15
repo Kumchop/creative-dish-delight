@@ -4,6 +4,7 @@ import { consumeLastCapturedError } from "./lib/error-capture";
 import { renderErrorPage } from "./lib/error-page";
 import type { CartLine, OrderDetails } from "./lib/menu";
 import { menuRecords } from "./lib/menu-data";
+import { insertOrder, listOrders, getOrder, updateOrderStatus } from "@/lib/db";
 
 type ServerEntry = {
   fetch: (request: Request, env: unknown, ctx: unknown) => Promise<Response> | Response;
@@ -97,14 +98,25 @@ const appendOrderToFile = async (order: OrderSubmission): Promise<boolean> => {
     await fs.appendFile(ORDERS_PATH, JSON.stringify(order) + "\n", { encoding: "utf8" });
     return true;
   } catch (err) {
-    console.warn("Could not write order to file system (this may be an edge/runtime limitation). Falling back to in-memory storage.", err);
-    // Fall through to in-memory storage
+    console.warn("Could not write order to file system (this may be an edge/runtime limitation). Falling back to DB/in-memory storage.", err);
+    // Fall through to fallback behavior
     return false;
   }
 };
 
 const upsertOrder = async (order: OrderSubmission) => {
-  const persisted = await appendOrderToFile(order);
+  let persistedToFile = false;
+  try {
+    persistedToFile = await appendOrderToFile(order);
+  } catch {}
+
+  let persistedToDb = false;
+  try {
+    insertOrder(order);
+    persistedToDb = true;
+  } catch (err) {
+    console.warn("Could not persist order to SQLite DB", err);
+  }
 
   const globalWithOrders = globalThis as typeof globalThis & {
     __kumchopOrders?: OrderSubmission[];
@@ -113,7 +125,7 @@ const upsertOrder = async (order: OrderSubmission) => {
   globalWithOrders.__kumchopOrders ??= [];
   globalWithOrders.__kumchopOrders.push(order);
 
-  return persisted;
+  return persistedToFile || persistedToDb;
 };
 
 const buildOrderSummary = (order: OrderSubmission): string => {
@@ -198,6 +210,44 @@ const maybeSendWhatsAppToRestaurant = async (order: OrderSubmission): Promise<bo
   }
 };
 
+function parseBasicAuth(request: Request): { user: string; pass: string } | null {
+  const auth = request.headers.get("authorization");
+  if (!auth || !auth.startsWith("Basic ")) return null;
+  try {
+    const b64 = auth.slice(6);
+    const decoded = atob(b64);
+    const sep = decoded.indexOf(":");
+    if (sep === -1) return null;
+    const user = decoded.slice(0, sep);
+    const pass = decoded.slice(sep + 1);
+    return { user, pass };
+  } catch {
+    return null;
+  }
+}
+
+function requireAdminAuth(request: Request): { ok: true } | { ok: false; response: Response } {
+  const creds = parseBasicAuth(request);
+  const adminUser = getEnv("ADMIN_USER");
+  const adminPass = getEnv("ADMIN_PASS");
+  if (!adminUser || !adminPass) {
+    return { ok: false, response: new Response(JSON.stringify({ ok: false, message: "Admin credentials not configured on server." }), { status: 500, headers: { "content-type": "application/json" } }) };
+  }
+  if (!creds) {
+    return {
+      ok: false,
+      response: new Response(JSON.stringify({ ok: false, message: "Authentication required." }), { status: 401, headers: { "content-type": "application/json", "WWW-Authenticate": 'Basic realm="Kumchop admin"' } }),
+    };
+  }
+  if (creds.user !== adminUser || creds.pass !== adminPass) {
+    return {
+      ok: false,
+      response: new Response(JSON.stringify({ ok: false, message: "Invalid credentials." }), { status: 403, headers: { "content-type": "application/json" } }),
+    };
+  }
+  return { ok: true };
+}
+
 const handleOrderSubmission = async (request: Request): Promise<Response> => {
   try {
     const payload = (await request.json()) as unknown;
@@ -270,6 +320,57 @@ function isH3SwallowedErrorBody(body: string): boolean {
 export default {
   async fetch(request: Request, env: unknown, ctx: unknown) {
     const url = new URL(request.url);
+
+    // Admin API: Basic auth protected
+    if (url.pathname.startsWith("/api/admin/orders")) {
+      const auth = requireAdminAuth(request);
+      if (!auth.ok) return auth.response;
+
+      // GET /api/admin/orders
+      if (request.method === "GET" && url.pathname === "/api/admin/orders") {
+        const limit = Number(url.searchParams.get("limit") ?? "50");
+        const offset = Number(url.searchParams.get("offset") ?? "0");
+        try {
+          const rows = listOrders(limit, offset);
+          return new Response(JSON.stringify({ ok: true, orders: rows }), { status: 200, headers: { "content-type": "application/json" } });
+        } catch (err) {
+          console.error(err);
+          return new Response(JSON.stringify({ ok: false, message: "Could not list orders." }), { status: 500, headers: { "content-type": "application/json" } });
+        }
+      }
+
+      // GET /api/admin/orders/:id
+      if (request.method === "GET" && url.pathname.startsWith("/api/admin/orders/")) {
+        const id = url.pathname.split("/").at(-1) as string;
+        try {
+          const ord = getOrder(id);
+          if (!ord) return new Response(JSON.stringify({ ok: false, message: "Order not found." }), { status: 404, headers: { "content-type": "application/json" } });
+          return new Response(JSON.stringify({ ok: true, order: ord }), { status: 200, headers: { "content-type": "application/json" } });
+        } catch (err) {
+          console.error(err);
+          return new Response(JSON.stringify({ ok: false, message: "Could not fetch order." }), { status: 500, headers: { "content-type": "application/json" } });
+        }
+      }
+
+      // POST /api/admin/orders/:id/status
+      if (request.method === "POST" && url.pathname.startsWith("/api/admin/orders/") && url.pathname.endsWith("/status")) {
+        const parts = url.pathname.split("/");
+        const id = parts[parts.length - 2];
+        try {
+          const body = await request.json();
+          const status = body?.status as string | undefined;
+          if (!status) return new Response(JSON.stringify({ ok: false, message: "Missing status." }), { status: 400, headers: { "content-type": "application/json" } });
+          const ok = updateOrderStatus(id, status);
+          if (!ok) return new Response(JSON.stringify({ ok: false, message: "Order not found or not updated." }), { status: 404, headers: { "content-type": "application/json" } });
+          return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+        } catch (err) {
+          console.error(err);
+          return new Response(JSON.stringify({ ok: false, message: "Could not update status." }), { status: 500, headers: { "content-type": "application/json" } });
+        }
+      }
+
+      return new Response(JSON.stringify({ ok: false, message: "Unsupported admin API route or method." }), { status: 404, headers: { "content-type": "application/json" } });
+    }
 
     if (request.method === "POST" && url.pathname === "/api/orders") {
       return handleOrderSubmission(request);
